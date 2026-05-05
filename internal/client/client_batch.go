@@ -161,8 +161,18 @@ type batchCommandsEntry struct {
 	forwardedHost string
 	// canceled indicated the request is canceled or not.
 	canceled int32
-	err      error
-	pri      uint64
+	// terminated guards entry.error / entry.response so the entry can only be
+	// fulfilled once. This makes the close/Close races on the cancel hook,
+	// recv-loop response, recv-loop close-defer and failRequest paths safe
+	// against duplicate `close(b.res)` panics and duplicate `cb.Schedule`.
+	terminated atomic.Bool
+	// owner is the batchCommandsClient that has tracked this entry in its
+	// `batched` map. It is published by `c.send()` together with `requestID`.
+	// Async cancellation uses it to remove the entry from `c.batched` so
+	// failAsyncRequestsOnClose does not re-fire it. Nil before publication.
+	owner atomic.Pointer[batchCommandsClient]
+	err   error
+	pri   uint64
 
 	// reqArriveAt indicates when the batch commands entry is generated and sent to the batch conn channel.
 	reqArriveAt time.Time
@@ -201,6 +211,9 @@ func (b *batchCommandsEntry) async() bool {
 }
 
 func (b *batchCommandsEntry) response(resp *tikvpb.BatchCommandsResponse_Response) {
+	if !b.terminated.CompareAndSwap(false, true) {
+		return
+	}
 	if b.async() {
 		b.cb.Schedule(tikvrpc.FromBatchCommandsResponse(resp))
 	} else {
@@ -209,6 +222,9 @@ func (b *batchCommandsEntry) response(resp *tikvpb.BatchCommandsResponse_Respons
 }
 
 func (b *batchCommandsEntry) error(err error) {
+	if !b.terminated.CompareAndSwap(false, true) {
+		return
+	}
 	b.err = err
 	if b.async() {
 		b.cb.Schedule(nil, err)
@@ -1018,6 +1034,7 @@ func (c *batchCommandsClient) send(forwardedHost string, grp *batchCommandsReque
 		entry := grp.entries[i]
 		entry.batchState.Store(grp.state)
 		entry.requestID.Store(requestID)
+		entry.owner.Store(c)
 		c.batched.Store(requestID, entry)
 		c.sent.Add(1)
 		c.metrics.trackedRequestCounter(entry.forwardedHost != "").Inc()
@@ -1088,9 +1105,34 @@ func (c *batchCommandsClient) failRequestsByIDs(err error, requestIDs []uint64) 
 }
 
 func (c *batchCommandsClient) failRequest(err error, requestID uint64, entry *batchCommandsEntry) {
-	c.batched.Delete(requestID)
+	// Only one caller may decrement c.sent / bump the retired counter for a
+	// given requestID. Multiple goroutines (per-stream recv-loop defers,
+	// failRequestsByIDs after a Send error, the async cancel hook) can race
+	// into this path; LoadAndDelete makes the bookkeeping idempotent.
+	if _, loaded := c.batched.LoadAndDelete(requestID); !loaded {
+		return
+	}
 	c.sent.Add(-1)
 	c.metrics.retiredRequestCounter(entry.forwardedHost != "").Inc()
+	// entry.error is itself idempotent via the terminated CAS, so it is safe
+	// even if a different code path (e.g. the cancel hook) already fulfilled
+	// the entry without going through the c.batched map.
+	entry.error(err)
+}
+
+// cancelAsyncEntry is invoked from the async cancellation hook
+// (context.AfterFunc in client_async.go). It removes the entry from c.batched
+// and decrements c.sent if the entry was still tracked, and unconditionally
+// publishes the cancellation error to the entry (entry.error is itself
+// idempotent). This prevents failAsyncRequestsOnClose from later re-firing the
+// entry after a context-cancel.
+func (c *batchCommandsClient) cancelAsyncEntry(entry *batchCommandsEntry, err error) {
+	if requestID := entry.requestID.Load(); requestID > 0 {
+		if _, loaded := c.batched.LoadAndDelete(requestID); loaded {
+			c.sent.Add(-1)
+			c.metrics.retiredRequestCounter(entry.forwardedHost != "").Inc()
+		}
+	}
 	entry.error(err)
 }
 

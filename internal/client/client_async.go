@@ -142,7 +142,16 @@ func (c *RPCClient) SendRequestAsync(ctx context.Context, addr string, req *tikv
 
 	stop = context.AfterFunc(ctx, func() {
 		logutil.Logger(ctx).Debug("async send request cancelled (context done)", zap.String("to", addr), zap.Error(ctx.Err()))
-		entry.error(ctx.Err())
+		// If the entry has already been published to the owning batch client,
+		// remove it from c.batched and decrement c.sent so a later
+		// failAsyncRequestsOnClose does not re-fire the entry. cancelAsyncEntry
+		// also calls entry.error (idempotent). If the entry has not yet been
+		// published (owner not set), just publish the cancellation directly.
+		if owner := entry.owner.Load(); owner != nil {
+			owner.cancelAsyncEntry(entry, ctx.Err())
+		} else {
+			entry.error(ctx.Err())
+		}
 		atomic.StoreInt32(&entry.canceled, 1)
 	})
 
