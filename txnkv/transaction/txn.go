@@ -612,7 +612,7 @@ func (txn *KVTxn) InitPipelinedMemDB() error {
 	pipelinedMemDB := unionstore.NewPipelinedMemDB(func(ctx context.Context, keys [][]byte) (map[string]tikv.ValueEntry, error) {
 		return txn.snapshot.BatchGetWithTier(ctx, keys, txnsnapshot.BatchGetBufferTier, tikv.BatchGetOptions{})
 	}, func(generation uint64, memdb *unionstore.MemDB) (err error) {
-		if atomic.LoadUint32((*uint32)(&txn.committer.state)) == uint32(stateClosed) {
+		if txn.committer.ttlManager.getState() == stateClosed {
 			return errors.New("ttl manager is closed")
 		}
 		startTime := time.Now()

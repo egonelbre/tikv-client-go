@@ -1250,9 +1250,39 @@ func (m *minCommitTsManager) getRequiredWriteAccess() WriteAccessLevel {
 }
 
 type ttlManager struct {
+	// mu serializes state transitions and the ch / gen fields associated with
+	// them. Without this lock, run/close/reset can race so that close() observes
+	// state==Running before run() has assigned tm.ch (panic: close of nil
+	// channel), or a stale keepAlive goroutine left over from a prior run can
+	// close the channel of a freshly-started ttlManager.
+	mu      sync.Mutex
 	state   ttlManagerState
 	ch      chan struct{}
 	lockCtx *kv.LockCtx
+	// gen identifies the current "incarnation" of the ttlManager. It is
+	// incremented every time run() transitions Uninitialized->Running.
+	// keepAlive captures the generation it was spawned with and only closes
+	// the ttlManager via closeFromKeepAlive(gen) when its generation still
+	// matches. This prevents an old keepAlive that survived a reset from
+	// shutting down the freshly-started ttlManager.
+	gen uint64
+}
+
+// tryStart performs the Uninitialized->Running state transition under tm.mu
+// and atomically allocates the close channel and bumps the generation. It
+// returns the channel and generation that the caller should hand to keepAlive,
+// and started=false if the ttlManager was not in stateUninitialized.
+func (tm *ttlManager) tryStart(lockCtx *kv.LockCtx) (ch chan struct{}, gen uint64, started bool) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if tm.state != stateUninitialized {
+		return nil, 0, false
+	}
+	tm.state = stateRunning
+	tm.ch = make(chan struct{})
+	tm.lockCtx = lockCtx
+	tm.gen++
+	return tm.ch, tm.gen, true
 }
 
 func (tm *ttlManager) run(c *twoPhaseCommitter, lockCtx *kv.LockCtx, isPipelinedTxn bool) {
@@ -1261,27 +1291,55 @@ func (tm *ttlManager) run(c *twoPhaseCommitter, lockCtx *kv.LockCtx, isPipelined
 	}
 
 	// Run only once.
-	if !atomic.CompareAndSwapUint32((*uint32)(&tm.state), uint32(stateUninitialized), uint32(stateRunning)) {
+	ch, gen, started := tm.tryStart(lockCtx)
+	if !started {
 		return
 	}
-	tm.ch = make(chan struct{})
-	tm.lockCtx = lockCtx
 
-	go keepAlive(c, tm.ch, tm, c.primary(), lockCtx, isPipelinedTxn)
+	go keepAlive(c, ch, gen, tm, c.primary(), lockCtx, isPipelinedTxn)
 }
 
 func (tm *ttlManager) close() {
-	if !atomic.CompareAndSwapUint32((*uint32)(&tm.state), uint32(stateRunning), uint32(stateClosed)) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if tm.state != stateRunning {
 		return
 	}
+	tm.state = stateClosed
+	close(tm.ch)
+}
+
+// closeFromKeepAlive is the close path used by the keepAlive goroutine itself.
+// It only closes the ttlManager when the caller's generation still matches the
+// current generation, so a stale keepAlive that survived a reset() + a new
+// run() does not close the channel belonging to the new incarnation.
+func (tm *ttlManager) closeFromKeepAlive(gen uint64) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if tm.state != stateRunning || tm.gen != gen {
+		return
+	}
+	tm.state = stateClosed
 	close(tm.ch)
 }
 
 func (tm *ttlManager) reset() {
-	if !atomic.CompareAndSwapUint32((*uint32)(&tm.state), uint32(stateRunning), uint32(stateUninitialized)) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if tm.state != stateRunning {
 		return
 	}
+	tm.state = stateUninitialized
 	close(tm.ch)
+}
+
+// getState returns the current ttlManager state under the mutex. External
+// readers (probes, pipelined-flush callbacks) must use this rather than
+// reading tm.state directly to avoid racing with run/close/reset transitions.
+func (tm *ttlManager) getState() ttlManagerState {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	return tm.state
 }
 
 const keepAliveMaxBackoff = 20000
@@ -1293,7 +1351,7 @@ const broadcastMaxBackoff = 10000
 // keepAlive keeps sending heartbeat to update the primary key's TTL
 // For pipelined transactions, it also updates min_commit_ts, and broadcasts it to all TiKVs.
 func keepAlive(
-	c *twoPhaseCommitter, closeCh chan struct{}, tm *ttlManager, primaryKey []byte,
+	c *twoPhaseCommitter, closeCh chan struct{}, gen uint64, tm *ttlManager, primaryKey []byte,
 	lockCtx *kv.LockCtx, isPipelinedTxn bool,
 ) {
 	// Ticker is set to 1/2 of the ManagedLockTTL.
@@ -1345,7 +1403,7 @@ func keepAlive(
 				if isPipelinedTxn {
 					// the pipelined txn can last a long time after max ttl exceeded.
 					// if we don't stop it, it may fail when committing the primary key with high probability.
-					tm.close()
+					tm.closeFromKeepAlive(gen)
 				}
 				return
 			}
@@ -1387,7 +1445,7 @@ func keepAlive(
 						// pipelined DML cannot run without the ttlManager.
 						// Once the ttl manager fails, the transaction should be rolled back to avoid writing useless locks.
 						// close the ttlManager and the further flush will stop.
-						tm.close()
+						tm.closeFromKeepAlive(gen)
 					}
 					return
 				}
