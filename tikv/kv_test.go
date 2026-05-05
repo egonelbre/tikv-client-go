@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -280,6 +281,140 @@ func (s *testKVSuite) TestErrorHalfwayInNewKVStore() {
 	// this is a leak test, TestMain will check goroutine leak
 	_, err := NewKVStore("TestErrorHalfwayInNewKVStore", s.store.pdClient, NewMockSafePointKV(), &mocktikv.RPCClient{})
 	require.Error(s.T(), err)
+}
+
+// uncancellableSafeTsMockClient is a Client that holds StoreSafeTS RPCs blocked
+// on release and DOES NOT honor ctx cancellation. It tracks how many workers
+// are in-flight. This is used to verify that KVStore.Close() waits for
+// safeTSUpdater per-store goroutines to finish before returning.
+type uncancellableSafeTsMockClient struct {
+	Client
+	release  chan struct{}
+	started  chan struct{}
+	startOne sync.Once
+	inflight atomic.Int32
+}
+
+func (c *uncancellableSafeTsMockClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (*tikvrpc.Response, error) {
+	if req.Type != tikvrpc.CmdStoreSafeTS {
+		return c.Client.SendRequest(ctx, addr, req, timeout)
+	}
+	c.inflight.Add(1)
+	defer c.inflight.Add(-1)
+	c.startOne.Do(func() { close(c.started) })
+	// Intentionally ignore ctx.Done() — the per-store goroutines should
+	// remain alive after KVStore.Close() cancels s.ctx so we can detect
+	// whether Close waited for them.
+	<-c.release
+	return &tikvrpc.Response{Resp: &kvrpcpb.StoreSafeTSResponse{SafeTs: 100}}, nil
+}
+
+func (c *uncancellableSafeTsMockClient) Close() error                { return c.Client.Close() }
+func (c *uncancellableSafeTsMockClient) CloseAddr(addr string) error { return c.Client.CloseAddr(addr) }
+
+// TestCloseWaitsForSafeTSUpdaterWorkers verifies that KVStore.Close() does not
+// return while per-store goroutines spawned by updateSafeTS are still running.
+//
+// Bug: safeTSUpdater spawned one goroutine per store inside updateSafeTS that
+// were tracked only by a function-local sync.WaitGroup, not by s.wg. The
+// goroutine pool s.gP was also closed via a defer at the top of Close() so it
+// shut down LIFO — after every other dependency (oracle, regionCache, tikv
+// client, pdClient) was already torn down. As a result, in-flight per-store
+// goroutines could observe torn-down clients during shutdown.
+//
+// Fix: register the per-store goroutines on s.wg and order Close so the
+// goroutine pool drains before dependencies are released. With the fix,
+// s.wg.Wait() inside Close blocks until the per-store fan-out finishes.
+func TestCloseWaitsForSafeTSUpdaterWorkers(t *testing.T) {
+	util.EnableFailpoints()
+	tikvClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	mockGetMinResolvedTSByStoresIDs := atomic.Pointer[func(ctx context.Context, ids []uint64) (uint64, map[uint64]uint64, error)]{}
+	stub := func(ctx context.Context, ids []uint64) (uint64, map[uint64]uint64, error) {
+		return 0, nil, nil
+	}
+	mockGetMinResolvedTSByStoresIDs.Store(&stub)
+	store, err := NewTestTiKVStore(tikvClient, pdClient, nil, nil, 0, Option(func(s *KVStore) {
+		s.pdHttpClient = &mockPDHTTPClient{
+			Client:                          pdhttp.NewClientWithServiceDiscovery("test", nil),
+			mockGetMinResolvedTSByStoresIDs: &mockGetMinResolvedTSByStoresIDs,
+		}
+	}))
+	require.NoError(t, err)
+
+	storeIDs, _, _, _ := mocktikv.BootstrapWithMultiStores(cluster, 2)
+	for _, sid := range storeIDs {
+		addr := fmt.Sprintf("store%d", sid)
+		labels := []*metapb.StoreLabel{{Key: DCLabelKey, Value: "z1"}}
+		cluster.UpdateStorePeerAddr(sid, addr, labels...)
+		store.regionCache.SetRegionCacheStore(sid, addr, addr, tikvrpc.TiKV, 1, labels)
+	}
+
+	mock := &uncancellableSafeTsMockClient{
+		Client:  store.GetTiKVClient(),
+		release: make(chan struct{}),
+		started: make(chan struct{}),
+	}
+	store.SetTiKVClient(mock)
+
+	// Spawn the per-store fan-out manually so we don't have to wait for the
+	// 2s safeTSUpdateInterval. Run in its own goroutine because updateSafeTS
+	// itself blocks until all spawned workers complete (they're held via
+	// release).
+	updateDone := make(chan struct{})
+	go func() {
+		defer close(updateDone)
+		store.updateSafeTS(context.Background())
+	}()
+
+	// Wait until at least one per-store goroutine has reached SendRequest.
+	select {
+	case <-mock.started:
+	case <-time.After(5 * time.Second):
+		close(mock.release)
+		<-updateDone
+		require.NoError(t, store.Close())
+		t.Fatal("timed out waiting for updateSafeTS to spawn worker")
+	}
+	require.GreaterOrEqual(t, mock.inflight.Load(), int32(1), "expected per-store worker to be in-flight")
+
+	// Now close the store concurrently. With the fix, Close's s.wg.Wait()
+	// blocks until the per-store goroutines exit. With the bug, Close races
+	// past wg.Wait() (since the workers aren't on s.wg) and tears down
+	// dependencies while workers are still in-flight.
+	closeReturned := make(chan error, 1)
+	go func() {
+		closeReturned <- store.Close()
+	}()
+
+	// Give Close a chance to advance.
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify Close has NOT returned yet — there is still an in-flight worker.
+	select {
+	case err := <-closeReturned:
+		t.Fatalf("Close returned (err=%v) while %d safeTSUpdater worker(s) still in-flight", err, mock.inflight.Load())
+	default:
+	}
+	require.GreaterOrEqual(t, mock.inflight.Load(), int32(1), "worker exited prematurely")
+
+	// Release the workers; updateSafeTS finishes, then Close should return.
+	close(mock.release)
+
+	select {
+	case <-updateDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("updateSafeTS did not return after release")
+	}
+
+	select {
+	case err := <-closeReturned:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return after updateSafeTS finished")
+	}
+
+	require.Equal(t, int32(0), mock.inflight.Load(), "per-store goroutines still running after Close returned")
 }
 
 func TestKVStoreCloseCheckRegionCacheClosedBeforePDClose(t *testing.T) {

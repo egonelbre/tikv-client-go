@@ -499,10 +499,18 @@ func (s *KVStore) GetSnapshot(ts uint64) *txnsnapshot.KVSnapshot {
 
 // Close store
 func (s *KVStore) Close() error {
-	defer s.gP.Close()
 	s.close.Store(true)
 	s.cancel()
+	// Wait for background goroutines (registered on s.wg) to finish before
+	// tearing down dependencies they may touch (oracle, regionCache, tikv
+	// client, pdClient). This includes the per-store fan-out goroutines
+	// spawned by updateSafeTS, which are now registered on s.wg.
 	s.wg.Wait()
+	// Drain the shared goroutine pool before closing dependencies. Tasks
+	// submitted via s.Go(...) may hold references to the clients/region
+	// cache/oracle that are about to be released, so the pool must finish
+	// first to avoid use-after-close races during shutdown.
+	s.gP.Close()
 
 	s.oracle.Close()
 	if s.txnLatches != nil {
@@ -829,7 +837,13 @@ func (s *KVStore) updateSafeTS(ctx context.Context) {
 		if store.IsTiFlash() {
 			storeAddr = store.GetPeerAddr()
 		}
+		// Register on s.wg so KVStore.Close() blocks until these per-store
+		// goroutines exit. Without this, in-flight workers can outlive
+		// Close's s.wg.Wait() and observe torn-down dependencies (region
+		// cache, tikv client, pd client).
+		s.wg.Add(1)
 		go func(ctx context.Context, wg *sync.WaitGroup, storeID uint64, storeAddr string) {
+			defer s.wg.Done()
 			defer wg.Done()
 
 			var (
