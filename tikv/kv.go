@@ -882,10 +882,15 @@ func (s *KVStore) updateSafeTS(ctx context.Context) {
 			txnScopeMap[label] = append(txnScopeMap[label], store.StoreID())
 		}
 	}
+	// Wait for all per-store goroutines to finish writing safeTSMap before
+	// computing the per-scope minimum. Otherwise updateMinSafeTS reads a
+	// partial snapshot and can publish 0 for stores whose goroutines have
+	// not yet called setSafeTS, briefly dropping the stale-read TS to 0
+	// each tick. See doc/client/confirmed/tikv.md.
+	wg.Wait()
 	for txnScope, storeIDs := range txnScopeMap {
 		s.updateMinSafeTS(txnScope, storeIDs)
 	}
-	wg.Wait()
 }
 
 func (s *KVStore) getMinResolvedTSByStoresIDs(ctx context.Context, storeIDs []uint64) (uint64, map[uint64]uint64, error) {

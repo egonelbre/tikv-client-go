@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -280,6 +281,102 @@ func (s *testKVSuite) TestErrorHalfwayInNewKVStore() {
 	// this is a leak test, TestMain will check goroutine leak
 	_, err := NewKVStore("TestErrorHalfwayInNewKVStore", s.store.pdClient, NewMockSafePointKV(), &mocktikv.RPCClient{})
 	require.Error(s.T(), err)
+}
+
+// blockingSafeTsMockClient is a Client that holds StoreSafeTS RPCs blocked on
+// release, returning a fixed safeTS once released. It is used to make the
+// per-store goroutines spawned by updateSafeTS still in-flight while the
+// parent goroutine attempts to compute the per-scope minimum.
+type blockingSafeTsMockClient struct {
+	Client
+	release  chan struct{}
+	started  chan struct{}
+	startOne sync.Once
+	safeTS   uint64
+}
+
+func (c *blockingSafeTsMockClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (*tikvrpc.Response, error) {
+	if req.Type != tikvrpc.CmdStoreSafeTS {
+		return c.Client.SendRequest(ctx, addr, req, timeout)
+	}
+	c.startOne.Do(func() { close(c.started) })
+	select {
+	case <-c.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return &tikvrpc.Response{Resp: &kvrpcpb.StoreSafeTSResponse{SafeTs: c.safeTS}}, nil
+}
+
+func (c *blockingSafeTsMockClient) Close() error                { return c.Client.Close() }
+func (c *blockingSafeTsMockClient) CloseAddr(addr string) error { return c.Client.CloseAddr(addr) }
+
+// TestUpdateSafeTSWaitsForWorkers exercises the bug where updateSafeTS computes
+// the per-scope minimum before its per-store fan-out goroutines have written
+// safeTSMap. With the buggy ordering, the per-scope minimum gets set to 0 on a
+// cycle where a store's safeTSMap entry is missing because getSafeTS returns
+// !ok before the goroutine has called setSafeTS. The fix waits for the workers
+// before computing the minimum, so the published min reflects the smallest
+// value actually written.
+func (s *testKVSuite) TestUpdateSafeTSWaitsForWorkers() {
+	// Replace the TiKV client with a blocking one so the per-store goroutines
+	// remain in-flight while the parent runs updateMinSafeTS.
+	mockClient := &blockingSafeTsMockClient{
+		Client:  s.store.GetTiKVClient(),
+		release: make(chan struct{}),
+		started: make(chan struct{}),
+		safeTS:  100,
+	}
+	s.store.SetTiKVClient(mockClient)
+
+	// Force the PD path to fall through to the per-store fan-out.
+	s.setGetMinResolvedTSByStoresIDs(func(ctx context.Context, ids []uint64) (uint64, map[uint64]uint64, error) {
+		return 0, nil, nil
+	})
+
+	// Ensure safeTSMap has no entry yet for the stores we'll update. This
+	// guarantees getSafeTS returns !ok in the parent's updateMinSafeTS call
+	// when the per-store goroutines have not yet written. Note: the suite
+	// SetupTest only adds stores to regionCache; it does not pre-populate
+	// safeTSMap. The background safeTSUpdater fires every 2s, so an initial
+	// synchronous call here observes an empty safeTSMap.
+	hasTikv, _ := s.store.getSafeTS(s.tikvStoreID)
+	hasTiflash, _ := s.store.getSafeTS(s.tiflashStoreID)
+	s.Require().False(hasTikv, "safeTSMap unexpectedly already populated for tikv store")
+	s.Require().False(hasTiflash, "safeTSMap unexpectedly already populated for tiflash store")
+
+	// Run updateSafeTS in its own goroutine so we can observe the published
+	// minSafeTS while its per-store workers are still blocked in SendRequest.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.store.updateSafeTS(context.Background())
+	}()
+
+	// Wait until at least one store goroutine has reached SendRequest. After
+	// this, with the buggy ordering, the parent has already raced ahead to
+	// updateMinSafeTS without waiting.
+	select {
+	case <-mockClient.started:
+	case <-time.After(5 * time.Second):
+		s.Fail("timed out waiting for SendRequest to start")
+	}
+
+	// Allow the per-store goroutines to complete and updateSafeTS to return.
+	close(mockClient.release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		s.Fail("timed out waiting for updateSafeTS to return")
+	}
+
+	// After updateSafeTS returns, every store should have a valid safeTS in
+	// safeTSMap. With the fix, the published per-scope minimum should reflect
+	// those writes (i.e. equal mockClient.safeTS). With the bug, the parent
+	// computed the minimum before the writes landed and published 0.
+	min := s.store.GetMinSafeTS(oracle.GlobalTxnScope)
+	s.Require().GreaterOrEqualf(min, mockClient.safeTS,
+		"GetMinSafeTS(GlobalTxnScope) = %d, want >= %d (workers' writes should be visible)", min, mockClient.safeTS)
 }
 
 func TestKVStoreCloseCheckRegionCacheClosedBeforePDClose(t *testing.T) {
