@@ -2,6 +2,7 @@ package txnlock
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -157,4 +158,66 @@ func TestTryAsyncResolve(t *testing.T) {
 	lockResolver.Close()
 	require.False(t, tryAsync())
 	waitSemaphoreSizeWithCheck(0)
+}
+
+// TestLockResolverCloseWaitsForAsyncResolves verifies that LockResolver.Close
+// blocks until any in-flight async resolve goroutines have actually exited.
+// Otherwise, those goroutines could continue to use lr.store (and friends)
+// after Close returns and the embedding KVStore has been torn down.
+func TestLockResolverCloseWaitsForAsyncResolves(t *testing.T) {
+	mockMetric := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "test_close_waits_for_async_resolves_running_tasks",
+		Help: "Test gauge for TestLockResolverCloseWaitsForAsyncResolves",
+	})
+
+	lockResolver := NewLockResolver(nil)
+
+	// Block the async resolve until we explicitly release it. Track whether the
+	// task has actually exited so we can detect a premature Close return.
+	enterLatch := make(chan struct{})
+	releaseLatch := make(chan struct{})
+	var taskExited atomic.Bool
+
+	require.True(t, lockResolver.asyncResolvePool.tryAsyncResolve(func() {
+		close(enterLatch)
+		<-releaseLatch
+		// Simulate touching lr.store / other resolver state right before exit;
+		// after Close returns, no goroutine must still be in here.
+		taskExited.Store(true)
+	}, mockMetric))
+
+	// Wait until the async goroutine is definitely running.
+	select {
+	case <-enterLatch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("async resolve goroutine never started")
+	}
+
+	// Run Close concurrently. It must not return until releaseLatch is closed.
+	closeReturned := make(chan struct{})
+	go func() {
+		lockResolver.Close()
+		close(closeReturned)
+	}()
+
+	// Give Close a chance to (incorrectly) return early. While the task is
+	// still blocked inside resolveFn, Close MUST NOT return.
+	select {
+	case <-closeReturned:
+		t.Fatal("LockResolver.Close returned before in-flight async resolve goroutine exited")
+	case <-time.After(100 * time.Millisecond):
+		// Expected: Close is still waiting.
+	}
+
+	// Release the async task; Close should now complete promptly.
+	close(releaseLatch)
+
+	select {
+	case <-closeReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("LockResolver.Close did not return after async resolve goroutine exited")
+	}
+
+	require.True(t, taskExited.Load(),
+		"async resolve goroutine must have completed before Close returned")
 }

@@ -726,7 +726,12 @@ type asyncResolveTaskPool struct {
 	semaphore                     chan struct{}
 	lastSemaphoreExhaustedLogTime atomic.Pointer[time.Time]
 	gp                            *gp.Pool
-	closed                        bool
+	// wg tracks in-flight async resolve goroutines so Close can wait for them
+	// to exit. The upstream gp.Pool.Close does not wait for inflight tasks, so
+	// without this barrier goroutines spawned via tryAsyncResolve could still
+	// touch the resolver's storage after Close returns.
+	wg     sync.WaitGroup
+	closed bool
 }
 
 func newAsyncResolveTaskPool(semaphore chan struct{}) *asyncResolveTaskPool {
@@ -755,6 +760,7 @@ func (p *asyncResolveTaskPool) tryAsyncResolve(
 		return false
 	}
 
+	p.wg.Add(1)
 	p.gp.Go(func() {
 		runningTasksMetric.Inc()
 		defer func() {
@@ -762,6 +768,7 @@ func (p *asyncResolveTaskPool) tryAsyncResolve(
 			p.releasePermit()
 			// stop holding resolveFn to release memory as soon as possible.
 			resolveFn = nil
+			p.wg.Done()
 		}()
 		resolveFn()
 	})
@@ -799,14 +806,20 @@ func (p *asyncResolveTaskPool) releasePermit() {
 	}
 }
 
-// Close closes the asyncResolveTaskPool
+// Close closes the asyncResolveTaskPool and waits for any in-flight async
+// resolve goroutines to exit. Waiting is required because gp.Pool.Close does
+// not wait for inflight tasks; without this barrier, async tasks could
+// outlive Close and continue using the LockResolver's storage.
 func (p *asyncResolveTaskPool) Close() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if !p.closed {
 		p.closed = true
 		p.gp.Close()
 	}
+	// Release p.mu before waiting so any tryAsyncResolve currently holding
+	// p.mu.RLock can finish and decrement the WaitGroup.
+	p.mu.Unlock()
+	p.wg.Wait()
 }
 
 type txnExpireTime struct {
