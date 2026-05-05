@@ -94,11 +94,19 @@ func (a *batchConn) fetchAllPendingRequests(maxBatchSize int) (headRecvTime time
 	var headEntry *batchCommandsEntry
 	select {
 	case headEntry = <-a.batchCommandsCh:
-		if !a.idleDetect.Stop() {
-			<-a.idleDetect.C
-		}
+		// Re-arm idleDetect for the next idle window. As of Go 1.23, Reset
+		// is safe on a running timer and is guaranteed not to deliver a
+		// stale value from before the Reset on t.C, so the legacy
+		// "Stop + drain + Reset" idiom is not only unnecessary but actively
+		// harmful: after Stop returns false (timer already fired and value
+		// consumed) the drain `<-t.C` blocks forever in Go 1.23+, hanging
+		// batchSendLoop. See https://pkg.go.dev/time#Timer.Reset.
 		a.idleDetect.Reset(idleTimeout)
 	case <-a.idleDetect.C:
+		// The timer fired and the value was just received from C. Re-arm so
+		// the timer is in a known, running state in case batchSendLoop is
+		// restarted (e.g. by the panic-recovery path in batchSendLoop) and
+		// re-enters this select with the same batchConn.
 		a.idleDetect.Reset(idleTimeout)
 		atomic.AddUint32(&a.idle, 1)
 		atomic.CompareAndSwapUint32(a.idleNotify, 0, 1)
@@ -183,7 +191,10 @@ func (a *batchConn) fetchMorePendingRequests(
 	}
 }
 
-const idleTimeout = 3 * time.Minute
+// idleTimeout controls how long batchSendLoop waits with no traffic before
+// declaring the connection idle. It is a var (not a const) so tests can shorten
+// it; production code never mutates it.
+var idleTimeout = 3 * time.Minute
 
 // BatchSendLoopPanicCounter is only used for testing.
 var BatchSendLoopPanicCounter int64 = 0
@@ -199,6 +210,14 @@ func (a *batchConn) batchSendLoop(cfg config.TiKVClient) {
 				zap.Stack("stack"))
 			atomic.AddInt64(&BatchSendLoopPanicCounter, 1)
 			logutil.BgLogger().Info("restart batchSendLoop", zap.Int64("count", atomic.LoadInt64(&BatchSendLoopPanicCounter)))
+			// Re-arm idleDetect to a known-running state before the restarted
+			// loop re-enters fetchAllPendingRequests. The panic could have
+			// occurred between Stop/Reset of the timer (or after the timer
+			// fired but before its value was consumed), leaving stale state
+			// that the restarted loop's select would otherwise observe.
+			// In Go 1.23+, Reset on any timer (running, expired, or stopped)
+			// is safe and is guaranteed not to deliver a pre-Reset value.
+			a.idleDetect.Reset(idleTimeout)
 			go a.batchSendLoop(cfg)
 		}
 	}()
