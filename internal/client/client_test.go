@@ -113,6 +113,40 @@ func TestGetConnAfterClose(t *testing.T) {
 	assert.True(t, state == connectivity.Shutdown)
 }
 
+// TestStreamTimeoutSendAfterClose ensures producers on connPool.streamTimeout
+// do not block forever after the pool is closed and the
+// CheckStreamTimeoutLoop drainer has exited. The buffered channel is filled
+// to capacity to simulate a real-world backlog at the moment Close races with
+// an in-flight stream RPC; once done is closed the drainer returns without
+// reading further, so an unconditional send blocks forever.
+func TestStreamTimeoutSendAfterClose(t *testing.T) {
+	pool := &connPool{
+		// Use a tiny buffer so we can deterministically saturate it.
+		streamTimeout: make(chan *tikvrpc.Lease, 1),
+		done:          make(chan struct{}),
+	}
+	// Saturate the buffer.
+	pool.streamTimeout <- &tikvrpc.Lease{}
+	// Simulate Close(): drainer goroutine has exited (we never started it),
+	// nothing reads from streamTimeout anymore, and done is closed.
+	close(pool.done)
+
+	// The send must not block. With the unconditional `pool.streamTimeout <- lease`
+	// pattern this would hang and the test would time out.
+	doneSending := make(chan bool, 1)
+	go func() {
+		doneSending <- pool.trySendStreamTimeout(&tikvrpc.Lease{})
+	}()
+	select {
+	case ok := <-doneSending:
+		// After Close + full buffer, the helper should observe done and bail
+		// rather than block.
+		assert.False(t, ok, "trySendStreamTimeout must return false after pool is closed and buffer is full")
+	case <-time.After(2 * time.Second):
+		t.Fatal("trySendStreamTimeout blocked after pool was closed; producer would leak")
+	}
+}
+
 func TestCancelTimeoutRetErr(t *testing.T) {
 	req := new(tikvpb.BatchCommandsRequest_Request)
 	a := newBatchConn(1, 1, nil)

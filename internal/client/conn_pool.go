@@ -199,6 +199,22 @@ func (a *connPool) Get() *grpc.ClientConn {
 	return a.conns[next].ClientConn
 }
 
+// trySendStreamTimeout enqueues a lease onto the streamTimeout channel for the
+// CheckStreamTimeoutLoop drainer. It returns false if the pool is already
+// closed (the drainer has exited), in which case the caller must not assume
+// the lease will be observed and is responsible for cleaning up directly. This
+// guards against the producer blocking forever when Close() races with an
+// in-flight stream RPC: the buffered channel may be full and, after Close,
+// nothing reads from it.
+func (a *connPool) trySendStreamTimeout(lease *tikvrpc.Lease) bool {
+	select {
+	case a.streamTimeout <- lease:
+		return true
+	case <-a.done:
+		return false
+	}
+}
+
 func (a *connPool) Close() {
 	if a.batchConn != nil {
 		a.batchConn.Close()

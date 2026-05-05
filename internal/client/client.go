@@ -455,7 +455,10 @@ func (c *RPCClient) getCopStreamResponse(ctx context.Context, client tikvpb.Tikv
 	copStream.Ctx = ctx
 	copStream.Bypass = resourcecontrol.MakeRequestInfo(req).Bypass()
 	copStream.CountRPC = true
-	connPool.streamTimeout <- &copStream.Lease
+	if !connPool.trySendStreamTimeout(&copStream.Lease) {
+		cancel()
+		return nil, errors.New("connPool is closed")
+	}
 
 	// Read the first streaming response to get CopStreamResponse.
 	// This can make error handling much easier, because SendReq() retry on
@@ -492,7 +495,10 @@ func (c *RPCClient) getBatchCopStreamResponse(ctx context.Context, client tikvpb
 	copStream.Cancel = cancel
 	copStream.Ctx = ctx
 	copStream.CountRPC = true
-	connPool.streamTimeout <- &copStream.Lease
+	if !connPool.trySendStreamTimeout(&copStream.Lease) {
+		cancel()
+		return nil, errors.New("connPool is closed")
+	}
 
 	// Read the first streaming response to get CopStreamResponse.
 	// This can make error handling much easier, because SendReq() retry on
@@ -526,7 +532,10 @@ func (c *RPCClient) getMPPStreamResponse(ctx context.Context, client tikvpb.Tikv
 	copStream := resp.Resp.(*tikvrpc.MPPStreamResponse)
 	copStream.Timeout = timeout
 	copStream.Cancel = cancel
-	connPool.streamTimeout <- &copStream.Lease
+	if !connPool.trySendStreamTimeout(&copStream.Lease) {
+		cancel()
+		return nil, errors.New("connPool is closed")
+	}
 
 	// Read the first streaming response to get CopStreamResponse.
 	// This can make error handling much easier, because SendReq() retry on
