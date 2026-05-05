@@ -3495,3 +3495,103 @@ func (s *testRegionCacheSuite) TestLocateRegionByIDFromPD() {
 	s.NotNil(cachedRegion)
 	s.Equal(region2, cachedRegion.GetID())
 }
+
+// TestRegionInvalidateRacesWithCheckRegionCacheTTL stresses the interaction
+// between Region.invalidate and Region.checkRegionCacheTTL. The CAS loop in
+// checkRegionCacheTTL can otherwise read a positive TTL snapshot, race with a
+// concurrent invalidate that writes expiredTTL, and then CAS the TTL back to a
+// positive value, leaving the region appearing valid even though it has been
+// invalidated.
+func TestRegionInvalidateRacesWithCheckRegionCacheTTL(t *testing.T) {
+	// Regression test for the race between Region.invalidate and
+	// Region.checkRegionCacheTTL. invalidate stores expiredTTL into r.ttl,
+	// but checkRegionCacheTTL takes a non-atomic snapshot of ttl and then
+	// CAS-extends r.ttl using that snapshot. If invalidate stores expiredTTL
+	// between the load and the CAS, a sufficiently aggressive set of
+	// concurrent checkers can clobber the expiredTTL sentinel back to a
+	// future newTTL, leaving the region appearing valid forever even though
+	// invalidReason has been set.
+	//
+	// We detect the bug by spinning many checkers and an invalidator, then
+	// after both stop, asserting r.isValid() == false. If the bug is
+	// present, isValid() may return true because r.ttl was CAS'd back to a
+	// positive value after invalidate stored expiredTTL.
+	const checkers = 8
+	for i := 0; i < 500; i++ {
+		r := &Region{}
+		now := time.Now().Unix()
+		// Start TTL inside the jitter window so checkRegionCacheTTL takes
+		// the CAS-extension branch.
+		atomic.StoreInt64(&r.ttl, now+1)
+		atomic.StoreInt32((*int32)(&r.invalidReason), int32(Ok))
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		var stop atomic.Bool
+
+		for j := 0; j < checkers; j++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				for !stop.Load() {
+					r.checkRegionCacheTTL(time.Now().Unix())
+				}
+			}()
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			r.invalidate(Other)
+			// Let checkers run a moment more so a stale-snapshot CAS can
+			// race with invalidate's ttl store.
+			time.Sleep(50 * time.Microsecond)
+			stop.Store(true)
+		}()
+
+		close(start)
+		wg.Wait()
+
+		// After invalidate has completed, the region must be invalid for
+		// every subsequent caller.
+		require.False(t, r.isValid(), "iter=%d ttl=%d invalidReason=%d", i, atomic.LoadInt64(&r.ttl), atomic.LoadInt32((*int32)(&r.invalidReason)))
+		require.Equal(t, int64(expiredTTL), atomic.LoadInt64(&r.ttl), "iter=%d: ttl was CAS-extended past invalidate; invalidReason=%d", i, atomic.LoadInt32((*int32)(&r.invalidReason)))
+	}
+}
+
+// TestCheckRegionCacheTTLRespectsInvalidReason exposes the exact pre-fix
+// scenario the invalidReason guard was added to handle: the transient state
+// between invalidate's two atomic operations.
+//
+// invalidate writes invalidReason first (CAS) and r.ttl=expiredTTL second.
+// Between those writes, a concurrent checkRegionCacheTTL whose loaded ttl
+// falls inside the jitter window (ts < ttl <= ts+regionCacheTTLSec) reaches
+// the CAS-extension branch. The CAS itself succeeds because the
+// StoreInt64(expiredTTL) has not yet run; without the explicit
+// invalidReason check the function CAS-extends r.ttl back to a future newTTL
+// and reports the region as valid, even though invalidate has already won
+// the invalidReason CAS.
+//
+// We reproduce the transient state directly (invalidReason=Other, ttl in
+// jitter window) and assert checkRegionCacheTTL returns false. With the
+// fix this holds; without the fix the function CAS-extends ttl and returns
+// true.
+func TestCheckRegionCacheTTLRespectsInvalidReason(t *testing.T) {
+	r := &Region{}
+	now := time.Now().Unix()
+	// Put ttl just above ts so checkRegionCacheTTL takes the CAS-extension
+	// branch (ts < ttl <= ts+regionCacheTTLSec).
+	atomic.StoreInt64(&r.ttl, now+1)
+	// Simulate the window inside invalidate after the invalidReason CAS but
+	// before StoreInt64(expiredTTL).
+	atomic.StoreInt32((*int32)(&r.invalidReason), int32(Other))
+
+	require.False(t, r.checkRegionCacheTTL(now),
+		"checkRegionCacheTTL must observe invalidReason!=Ok and refuse to CAS-extend a region that has been invalidated")
+	// The fix returns false without touching r.ttl. Without the fix the CAS
+	// would succeed and bump ttl to a future newTTL.
+	require.Equal(t, int64(now+1), atomic.LoadInt64(&r.ttl),
+		"checkRegionCacheTTL must not CAS-extend r.ttl after invalidReason has been set")
+}

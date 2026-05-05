@@ -439,6 +439,17 @@ func (r *Region) checkRegionCacheTTL(ts int64) bool {
 		if r.checkSyncFlags(needExpireAfterTTL) || ttl > ts+regionCacheTTLSec {
 			return true
 		}
+		// Refuse to extend TTL if the region has been invalidated. This
+		// guards against the TOCTOU between Region.invalidate (which sets
+		// invalidReason then stores expiredTTL into r.ttl) and the CAS
+		// below: if we observe a stale positive snapshot of r.ttl after a
+		// concurrent invalidate has already won the invalidReason CAS, we
+		// must not CAS r.ttl back to a future newTTL — otherwise we would
+		// resurrect a region that another goroutine has explicitly marked
+		// invalid.
+		if atomic.LoadInt32((*int32)(&r.invalidReason)) != int32(Ok) {
+			return false
+		}
 		if newTTL == 0 {
 			newTTL = nextTTL(ts)
 		}
