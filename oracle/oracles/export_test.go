@@ -74,8 +74,10 @@ func StartTsUpdateLoop(o oracle.Oracle, ctx context.Context, wg *sync.WaitGroup)
 		panic("expected pdOracle")
 	}
 	pd.quit = make(chan struct{})
+	pd.wg.Add(1)
 	wg.Add(1)
 	go func() {
+		// updateTS calls pd.wg.Done() via its own defer.
 		pd.updateTS(ctx)
 		wg.Done()
 	}()

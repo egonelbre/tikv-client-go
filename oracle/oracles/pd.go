@@ -122,6 +122,15 @@ type pdOracle struct {
 	// txn_scope (string) -> lastTSPointer (*atomic.Pointer[lastTSO])
 	lastTSMap sync.Map
 	quit      chan struct{}
+	// closeOnce guards close(quit) so that Close is idempotent.
+	closeOnce sync.Once
+	// wg awaits the updateTS background goroutine. Close blocks on it
+	// to guarantee the goroutine has exited before returning.
+	wg sync.WaitGroup
+	// cancelUpdateTS cancels the context passed to updateTS so that any
+	// in-flight PD GetTS RPC can be interrupted on shutdown. It is set
+	// only when the background updateTS goroutine is started.
+	cancelUpdateTS context.CancelFunc
 	// The configured interval to update the low resolution ts. Set by SetLowResolutionTimestampUpdateInterval.
 	// For TiDB, this is directly controlled by the system variable `tidb_low_resolution_tso_update_interval`.
 	lastTSUpdateInterval atomic.Int64
@@ -193,7 +202,10 @@ func NewPdOracle(pdClient pd.Client, options *PDOracleOptions) (oracle.Oracle, e
 
 	ctx := context.TODO()
 	if !options.NoUpdateTS {
-		go o.updateTS(ctx)
+		updateCtx, cancel := context.WithCancel(context.Background())
+		o.cancelUpdateTS = cancel
+		o.wg.Add(1)
+		go o.updateTS(updateCtx)
 	}
 	// Initialize the timestamp of the global txnScope by Get.
 	_, err := o.GetTimestamp(ctx, &oracle.Option{TxnScope: oracle.GlobalTxnScope})
@@ -459,6 +471,7 @@ func (o *pdOracle) nextUpdateInterval(now time.Time, requiredStaleness time.Dura
 }
 
 func (o *pdOracle) updateTS(ctx context.Context) {
+	defer o.wg.Done()
 	currentInterval := time.Duration(o.lastTSUpdateInterval.Load())
 	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
@@ -523,7 +536,19 @@ func (o *pdOracle) UntilExpired(lockTS uint64, TTL uint64, opt *oracle.Option) i
 }
 
 func (o *pdOracle) Close() {
-	close(o.quit)
+	o.closeOnce.Do(func() {
+		close(o.quit)
+		// Cancel the updateTS context so any in-flight PD GetTS RPC
+		// can return promptly instead of blocking shutdown.
+		if o.cancelUpdateTS != nil {
+			o.cancelUpdateTS()
+		}
+	})
+	// Always wait for the background updateTS goroutine to exit before
+	// returning. This is safe to call from any caller; wg.Wait() is a
+	// no-op once the goroutine has finished, and idempotent across
+	// multiple Close() invocations.
+	o.wg.Wait()
 }
 
 // A future that resolves immediately to a low resolution timestamp.
