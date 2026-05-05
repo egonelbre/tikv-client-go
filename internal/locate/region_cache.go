@@ -543,7 +543,14 @@ func until(f func() bool) func(context.Context, time.Time) bool {
 type bgRunner struct {
 	ctx    context.Context
 	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	// mu protects the closed flag and serializes wg.Add against shutdown's
+	// wg.Wait. Without it, a concurrent shutdown can call cancel() + Wait()
+	// between a spawner's closed()-check and its wg.Add(1), causing the
+	// runtime to panic with "sync: WaitGroup is reused before previous Wait
+	// has returned" / "WaitGroup.Add called concurrently with Wait".
+	mu       sync.Mutex
+	isClosed bool
+	wg       sync.WaitGroup
 }
 
 func newBackgroundRunner(ctx context.Context) *bgRunner {
@@ -563,7 +570,23 @@ func (r *bgRunner) closed() bool {
 	}
 }
 
+// tryAdd atomically checks the closed flag and, if not closed, calls
+// wg.Add(1). It returns true when the caller may spawn the goroutine and
+// must arrange for a matching wg.Done.
+func (r *bgRunner) tryAdd() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.isClosed {
+		return false
+	}
+	r.wg.Add(1)
+	return true
+}
+
 func (r *bgRunner) shutdown(wait bool) {
+	r.mu.Lock()
+	r.isClosed = true
+	r.mu.Unlock()
 	r.cancel()
 	if wait {
 		r.wg.Wait()
@@ -572,10 +595,9 @@ func (r *bgRunner) shutdown(wait bool) {
 
 // run calls `f` once in background.
 func (r *bgRunner) run(f func(context.Context)) {
-	if r.closed() {
+	if !r.tryAdd() {
 		return
 	}
-	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
 		f(r.ctx)
@@ -584,10 +606,9 @@ func (r *bgRunner) run(f func(context.Context)) {
 
 // schedule calls `f` every `interval`.
 func (r *bgRunner) schedule(f func(context.Context, time.Time) bool, interval time.Duration) {
-	if r.closed() || interval <= 0 {
+	if interval <= 0 || !r.tryAdd() {
 		return
 	}
-	r.wg.Add(1)
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer func() {
@@ -609,10 +630,9 @@ func (r *bgRunner) schedule(f func(context.Context, time.Time) bool, interval ti
 
 // scheduleWithTrigger likes schedule, but also call `f` when `<-trigger`, in which case the time arg of `f` is zero.
 func (r *bgRunner) scheduleWithTrigger(f func(context.Context, time.Time) bool, interval time.Duration, trigger <-chan struct{}) {
-	if r.closed() || interval <= 0 {
+	if interval <= 0 || !r.tryAdd() {
 		return
 	}
-	r.wg.Add(1)
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer func() {

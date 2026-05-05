@@ -125,6 +125,42 @@ func TestBackgroundRunner(t *testing.T) {
 		<-done
 	})
 
+	t.Run("ConcurrentScheduleAndShutdown", func(t *testing.T) {
+		// Stress-test that concurrent calls to run/schedule/scheduleWithTrigger
+		// alongside shutdown(true) do not panic with
+		// "sync: WaitGroup is reused before previous Wait has returned"
+		// or "WaitGroup.Add called concurrently with Wait".
+		// Without synchronization between closed() and wg.Add(1), the race
+		// detector and runtime detect the Add-after-Wait condition.
+		const spawners = 32
+		r := newBackgroundRunner(context.Background())
+		var startBarrier sync.WaitGroup
+		startBarrier.Add(1)
+		var spawnersDone sync.WaitGroup
+		spawnersDone.Add(spawners)
+		for i := 0; i < spawners; i++ {
+			go func() {
+				defer spawnersDone.Done()
+				startBarrier.Wait()
+				for j := 0; j < 200; j++ {
+					r.run(func(ctx context.Context) {})
+					r.schedule(func(ctx context.Context, _ time.Time) bool {
+						return true
+					}, time.Hour)
+					r.scheduleWithTrigger(func(ctx context.Context, _ time.Time) bool {
+						return true
+					}, time.Hour, make(chan struct{}))
+				}
+			}()
+		}
+		// Release the spawners and immediately race shutdown.
+		startBarrier.Done()
+		// Give spawners a brief moment to start hammering Add(1).
+		time.Sleep(time.Microsecond)
+		r.shutdown(true)
+		spawnersDone.Wait()
+	})
+
 	t.Run("RunAfterShutdown", func(t *testing.T) {
 		var called atomic.Bool
 		r := newBackgroundRunner(context.Background())
