@@ -141,6 +141,45 @@ func TestExecCancelWhileWaiting(t *testing.T) {
 	require.Equal(t, 0, n)
 }
 
+// TestAppendDoesNotBlockWhenExecExitsViaCtx reproduces a deadlock where
+// Append flips state to Idle and then sends on the unbuffered ready channel
+// after Exec has already chosen the ctx.Done() arm of its waiting select.
+// Without the fix, the Append goroutine blocks forever on the send.
+func TestAppendDoesNotBlockWhenExecExitsViaCtx(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		l := NewRunLoop()
+		ctx, cancel := context.WithCancel(context.Background())
+
+		execDone := make(chan struct{})
+		go func() {
+			_, _ = l.Exec(ctx)
+			close(execDone)
+		}()
+
+		// Wait for Exec to park in the waiting select.
+		require.Eventually(t, func() bool { return l.State() == StateWaiting }, time.Second, 10*time.Microsecond)
+
+		appendDone := make(chan struct{})
+		go func() {
+			// Race: cancel may cause Exec's select to pick ctx.Done() before
+			// our Append send is consumed. With an unbuffered ready channel,
+			// the send blocks forever in that case.
+			l.Append(func() {})
+			close(appendDone)
+		}()
+
+		// Cancel concurrently with the Append send to provoke the race.
+		cancel()
+
+		select {
+		case <-appendDone:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d: Append blocked after ctx cancel", i)
+		}
+		<-execDone
+	}
+}
+
 func TestExecConcurrent(t *testing.T) {
 	defaultMaxProcs := runtime.GOMAXPROCS(0)
 	defer runtime.GOMAXPROCS(defaultMaxProcs)

@@ -42,7 +42,11 @@ type RunLoop struct {
 
 // NewRunLoop creates a new run-loop.
 func NewRunLoop() *RunLoop {
-	return &RunLoop{ready: make(chan struct{})}
+	// ready is a level-triggered "there is work" flag with capacity 1.
+	// Combined with the non-blocking send in Append, this prevents Append from
+	// blocking forever when Exec's waiting select picks the ctx.Done() arm
+	// concurrently with a wakeup.
+	return &RunLoop{ready: make(chan struct{}, 1)}
 }
 
 // Go submits f to the pool when possible (pool is not nil), otherwise starts a new goroutine for f.
@@ -87,7 +91,15 @@ func (l *RunLoop) Append(fs ...func()) {
 	l.lock.Unlock()
 
 	if notify {
-		l.ready <- struct{}{}
+		// Non-blocking send: the buffered slot is either empty (Exec is parked
+		// or about to park and will consume it) or already full (a previous
+		// wakeup is still pending, which is sufficient). This decouples the
+		// notification from the receiver's liveness, so Append never blocks
+		// even if Exec exits via ctx.Done().
+		select {
+		case l.ready <- struct{}{}:
+		default:
+		}
 	}
 }
 
