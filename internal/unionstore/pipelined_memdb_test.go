@@ -357,6 +357,37 @@ func TestPipelinedAdjustFlushCondition(t *testing.T) {
 	require.Nil(t, memdb.FlushWait())
 }
 
+func TestPipelinedFlushPanicRecovers(t *testing.T) {
+	util.EnableFailpoints()
+	require.Nil(t, failpoint.Enable("tikvclient/pipelinedMemDBMinFlushKeys", `return(1)`))
+	require.Nil(t, failpoint.Enable("tikvclient/pipelinedMemDBMinFlushSize", `return(1)`))
+	defer func() {
+		require.Nil(t, failpoint.Disable("tikvclient/pipelinedMemDBMinFlushKeys"))
+		require.Nil(t, failpoint.Disable("tikvclient/pipelinedMemDBMinFlushSize"))
+	}()
+
+	memdb := NewPipelinedMemDB(emptyBufferBatchGetter, func(_ uint64, db *MemDB) error {
+		panic("flushFunc deliberately panics")
+	})
+	require.Nil(t, memdb.Set([]byte("key"), []byte("value")))
+	flushed, err := memdb.Flush(false)
+	require.Nil(t, err)
+	require.True(t, flushed)
+
+	// FlushWait must not block forever when the flush goroutine panicked.
+	// Use a channel + timeout to fail fast rather than hang the test.
+	done := make(chan error, 1)
+	go func() {
+		done <- memdb.FlushWait()
+	}()
+	select {
+	case err := <-done:
+		require.Error(t, err, "FlushWait should return an error after a flush panic")
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "FlushWait blocked forever after flush goroutine panic")
+	}
+}
+
 func TestMemBufferBatchGetCache(t *testing.T) {
 	util.EnableFailpoints()
 	flushDone := make(chan struct{})

@@ -17,6 +17,7 @@ package unionstore
 import (
 	"context"
 	stderrors "errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -324,16 +325,24 @@ func (p *PipelinedMemDB) Flush(force bool) (bool, error) {
 	p.memDB.setSkipMutex(true)
 	p.generation++
 	go func(generation uint64) {
+		var err error
+		// Recover from panics in flushFunc so that subsequent Flush/FlushWait
+		// callers do not block forever waiting on errCh.
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("flush panic: %v", r)
+			}
+			p.onFlushing.Store(false)
+			// Send the error to errCh after onFlushing status is set to false.
+			// this guarantees the onFlushing.Store(true) in another goroutine's Flush happens after onFlushing.Store(false) in this function.
+			p.errCh <- err
+		}()
 		util.EvalFailpoint("beforePipelinedFlush")
 		metrics.TiKVPipelinedFlushLenHistogram.Observe(float64(p.flushingMemDB.Len()))
 		metrics.TiKVPipelinedFlushSizeHistogram.Observe(float64(p.flushingMemDB.Size()))
 		flushStart := time.Now()
-		err := p.flushFunc(generation, p.flushingMemDB)
+		err = p.flushFunc(generation, p.flushingMemDB)
 		metrics.TiKVPipelinedFlushDuration.Observe(time.Since(flushStart).Seconds())
-		p.onFlushing.Store(false)
-		// Send the error to errCh after onFlushing status is set to false.
-		// this guarantees the onFlushing.Store(true) in another goroutine's Flush happens after onFlushing.Store(false) in this function.
-		p.errCh <- err
 	}(p.generation)
 	p.onMemChange()
 	return true, nil
