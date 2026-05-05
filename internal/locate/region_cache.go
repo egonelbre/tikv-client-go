@@ -2146,12 +2146,17 @@ func (mu *regionIndexMu) insertRegionToCache(cachedRegion *Region, invalidateOld
 	if stale {
 		return false
 	}
-	// Insert the region (won't replace because of above deletion).
-	mu.sorted.ReplaceOrInsert(cachedRegion)
 	// Inherit the workTiKVIdx, workTiFlashIdx and buckets from the first intersected region.
+	// The regionStore on `cachedRegion` was already published via `setStore` in `newRegion`,
+	// so we must not mutate it in-place: a concurrent reader holding the same `*Region`
+	// (e.g., an external caller that re-inserts the same pointer) can fetch the store
+	// pointer with the lock-free `getStore()` and observe a torn write. Clone the store,
+	// apply inheritance to the clone, and CAS-publish — matching the pattern used by
+	// other mutators such as `switchWorkLeaderToPeer` / `switchNextFlashPeer`.
 	if len(intersectedRegions) > 0 {
 		oldRegion := intersectedRegions[0].cachedRegion
-		store := cachedRegion.getStore()
+		oldStore := cachedRegion.getStore()
+		newStore := oldStore.clone()
 		oldRegionStore := oldRegion.getStore()
 		// TODO(youjiali1995): remove this because the new retry logic can handle this issue.
 		//
@@ -2161,18 +2166,28 @@ func (mu *regionIndexMu) insertRegionToCache(cachedRegion *Region, invalidateOld
 		// To solve it, one solution is always to try a different peer if the invalid reason of the old cached region is no-leader.
 		// There is a small probability that the current peer who reports no-leader becomes a leader and TiDB has to retry once in this case.
 		if InvalidReason(atomic.LoadInt32((*int32)(&oldRegion.invalidReason))) == NoLeader {
-			store.workTiKVIdx = (oldRegionStore.workTiKVIdx + 1) % AccessIndex(store.accessStoreNum(tiKVOnly))
+			newStore.workTiKVIdx = (oldRegionStore.workTiKVIdx + 1) % AccessIndex(newStore.accessStoreNum(tiKVOnly))
 		}
 		// Don't refresh TiFlash work idx for region. Otherwise, it will always goto a invalid store which
 		// is under transferring regions.
-		store.workTiFlashIdx.Store(oldRegionStore.workTiFlashIdx.Load())
+		newStore.workTiFlashIdx.Store(oldRegionStore.workTiFlashIdx.Load())
 
 		// Keep the buckets information if needed.
-		if store.buckets == nil || (oldRegionStore.buckets != nil && store.buckets.GetVersion() < oldRegionStore.buckets.GetVersion()) {
+		if newStore.buckets == nil || (oldRegionStore.buckets != nil && newStore.buckets.GetVersion() < oldRegionStore.buckets.GetVersion()) {
 			metrics.TiKVStaleBucketFromPDCounter.Inc()
-			store.buckets = oldRegionStore.buckets
+			newStore.buckets = oldRegionStore.buckets
 		}
+		// Publish the inherited store atomically before exposing the region via the
+		// btree/map below. We use `setStore` (an atomic pointer store) rather than a
+		// single-attempt CAS because the in-place mutation we are replacing was
+		// unconditional too: this preserves "last writer wins" semantics for
+		// inheritance while removing the data race on the regionStore fields.
+		cachedRegion.setStore(newStore)
 	}
+	// Insert the region (won't replace because of above deletion). This must happen
+	// after the inheritance above so concurrent readers that find `cachedRegion` via
+	// the btree see the fully-published regionStore.
+	mu.sorted.ReplaceOrInsert(cachedRegion)
 	// The intersecting regions in the cache are probably stale, clear them.
 	for _, region := range intersectedRegions {
 		mu.removeVersionFromCache(region.cachedRegion.VerID(), region.cachedRegion.GetID())

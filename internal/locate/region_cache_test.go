@@ -3495,3 +3495,100 @@ func (s *testRegionCacheSuite) TestLocateRegionByIDFromPD() {
 	s.NotNil(cachedRegion)
 	s.Equal(region2, cachedRegion.GetID())
 }
+
+// TestInsertRegionToCacheRaceOnRegionStore demonstrates that
+// `(*regionIndexMu).insertRegionToCache` mutates the freshly-inserted region's
+// `*regionStore` in-place after `ReplaceOrInsert` has already published the
+// region. A concurrent reader that obtained the same `*Region` pointer earlier
+// (e.g., from a previous call returning the same object) and then reads its
+// `getStore()` fields without taking the cache lock observes a torn write.
+//
+// The race detector flags both the `store.workTiKVIdx` write at
+// `region_cache.go:2164` and the `store.buckets` write at `:2173`.
+//
+// To trigger the workTiKVIdx mutation, the inserted region's `invalidReason`
+// is pre-set to `NoLeader`; that branch reads `oldRegionStore.workTiKVIdx`
+// (an alias of the just-inserted region's store) and writes back to
+// `store.workTiKVIdx`. To trigger the buckets mutation, `store.buckets` is
+// reset to nil before each insertion so the "keep stale buckets" condition
+// fires and assigns to `store.buckets`.
+func TestInsertRegionToCacheRaceOnRegionStore(t *testing.T) {
+	mu := newRegionIndexMu(nil)
+
+	// Build a fresh *regionStore with one TiKV access entry so that
+	// `accessStoreNum(tiKVOnly)` returns 1 (avoids divide-by-zero in the
+	// inheritance branch's `% accessStoreNum`).
+	makeStore := func() *regionStore {
+		rs := &regionStore{
+			workTiKVIdx:  0,
+			proxyTiKVIdx: -1,
+			stores:       []*Store{{storeID: 1}},
+			storeEpochs:  []uint32{0},
+		}
+		rs.accessIndex[tiKVOnly] = []int{0}
+		return rs
+	}
+
+	// Use a single *Region object that is repeatedly inserted. After the
+	// first insertion it is held by the cache; the writer continues to
+	// re-insert the same pointer, which causes `intersectedRegions[0]` to
+	// be the same *Region whose store is then mutated in-place under the
+	// cache write lock — racing with the lock-free reader below.
+	fakeRegion := &Region{
+		meta: &metapb.Region{
+			Id:       42,
+			StartKey: []byte("a"),
+			EndKey:   []byte("z"),
+			RegionEpoch: &metapb.RegionEpoch{
+				ConfVer: 1,
+				Version: 1,
+			},
+		},
+		ttl: nextTTLWithoutJitter(time.Now().Unix()),
+	}
+	fakeRegion.setStore(makeStore())
+
+	// First insertion — primes the cache and exercises the no-intersect path.
+	mu.Lock()
+	require.True(t, mu.insertRegionToCache(fakeRegion, true, false))
+	mu.Unlock()
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Reader: lock-free read of the regionStore fields, mirroring how RPC
+	// callers consume `*Region`/`getStore()` after a cache lookup.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			rs := fakeRegion.getStore()
+			_ = rs.workTiKVIdx
+			_ = rs.buckets
+		}
+	}()
+
+	// Writer: repeatedly re-insert the same region. We force the inheritance
+	// branch to perform visible writes via:
+	//   - invalidReason=NoLeader  -> writes store.workTiKVIdx
+	//   - buckets stays nil       -> the "keep stale buckets" branch fires and
+	//                                writes store.buckets (= nil)
+	// Both writes happen on the freshly-published `*regionStore` (pre-fix this
+	// was the same pointer the reader observes via `getStore()`). After the fix
+	// the writes happen on a private clone before `setStore` publishes it
+	// atomically, so the reader never observes a torn field.
+	atomic.StoreInt32((*int32)(&fakeRegion.invalidReason), int32(NoLeader))
+	for i := 0; i < 200; i++ {
+		mu.Lock()
+		mu.insertRegionToCache(fakeRegion, true, false)
+		mu.Unlock()
+	}
+
+	close(stop)
+	wg.Wait()
+}
