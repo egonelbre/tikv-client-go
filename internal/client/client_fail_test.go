@@ -118,10 +118,10 @@ func TestRecvErrorInMultipleRecvLoops(t *testing.T) {
 	}
 
 	// Save all streams
-	clientSave := batchClient.client.Tikv_BatchCommandsClient
+	clientSave := batchClient.client.loadClient()
 	forwardedClientsSave := make(map[string]tikvpb.Tikv_BatchCommandsClient)
 	for host, client := range batchClient.forwardedClients {
-		forwardedClientsSave[host] = client.Tikv_BatchCommandsClient
+		forwardedClientsSave[host] = client.loadClient()
 	}
 	epoch := atomic.LoadUint64(&batchClient.epoch)
 
@@ -156,9 +156,9 @@ func TestRecvErrorInMultipleRecvLoops(t *testing.T) {
 	// Should only reconnect once.
 	assert.Equal(t, atomic.LoadUint64(&batchClient.epoch), epoch+1)
 	// All streams are refreshed.
-	assert.NotEqual(t, batchClient.client.Tikv_BatchCommandsClient, clientSave)
+	assert.NotEqual(t, batchClient.client.loadClient(), clientSave)
 	assert.Equal(t, len(batchClient.forwardedClients), len(forwardedClientsSave))
 	for host, clientSave := range forwardedClientsSave {
-		assert.NotEqual(t, batchClient.forwardedClients[host].Tikv_BatchCommandsClient, clientSave)
+		assert.NotEqual(t, batchClient.forwardedClients[host].loadClient(), clientSave)
 	}
 }

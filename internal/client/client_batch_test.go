@@ -15,6 +15,7 @@
 package client
 
 import (
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,6 +23,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/tikvpb"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 )
 
 func TestEncodedBatchCmd_SizeAndMarshalTo(t *testing.T) {
@@ -218,4 +220,73 @@ func TestEncodedMsgDataPool_ConcurrentSafety(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.Equal(t, int32(5000), successCount)
+}
+
+// fakeBatchClient is a minimal stand-in for tikvpb.Tikv_BatchCommandsClient
+// used by TestBatchCommandsStreamRecreateRace below. Only Send/Recv are ever
+// called by the test; the embedded grpc.ClientStream remains nil and other
+// methods would panic if invoked, which is intentional — they are not part
+// of the path under test.
+type fakeBatchClient struct {
+	grpc.ClientStream
+	id int
+}
+
+func (f *fakeBatchClient) Send(*tikvpb.BatchCommandsRequest) error {
+	return nil
+}
+
+func (f *fakeBatchClient) Recv() (*tikvpb.BatchCommandsResponse, error) {
+	// Return a benign error so recv() returns immediately without blocking.
+	return nil, io.EOF
+}
+
+// TestBatchCommandsStreamRecreateRace is a regression test for the data race
+// between batchCommandsStream.recreate (which writes the gRPC stream client
+// at client_batch.go:924) and a panic-restarted batchRecvLoop
+// (client_batch.go:1210) which reads the same field via streamClient.recv()
+// with no synchronization.
+//
+// The test exercises only the field write/read pattern that the bug is
+// rooted in, without spinning up a real gRPC connection. It is meant to be
+// run with `-race -count=N` so the race detector flags the unsynchronized
+// access on streamClient's gRPC client field before the fix is applied.
+//
+// Caveat: this is a white-box harness; it does not reproduce the full
+// panic-restart goroutine choreography described in
+// doc/client/confirmed/internal-client.md. It exercises only the underlying
+// unsynchronized field write/read that is the root cause of that race, which
+// is sufficient for the race detector to flag the bug deterministically.
+func TestBatchCommandsStreamRecreateRace(t *testing.T) {
+	const iterations = 200
+
+	for i := 0; i < iterations; i++ {
+		s := &batchCommandsStream{}
+		s.setClient(&fakeBatchClient{id: 0})
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// Writer goroutine: simulates the recreate() write at
+		// client_batch.go:924, which mutates the gRPC stream client field
+		// without holding any lock that the panic-restarted recv loop respects.
+		go func() {
+			defer wg.Done()
+			for j := 1; j <= 50; j++ {
+				s.setClient(&fakeBatchClient{id: j})
+			}
+		}()
+
+		// Reader goroutine: simulates a panic-restarted batchRecvLoop calling
+		// streamClient.recv(), which reads the gRPC stream client in order to
+		// invoke Recv().
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				_, _ = s.recv()
+			}
+		}()
+
+		wg.Wait()
+	}
 }

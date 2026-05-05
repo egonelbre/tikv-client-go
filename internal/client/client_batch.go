@@ -883,10 +883,46 @@ func (l *tryLock) unlockForRecreate() {
 }
 
 type batchCommandsStream struct {
-	tikvpb.Tikv_BatchCommandsClient
+	// client holds the underlying gRPC stream. It is read by recv() (called on
+	// each iteration of batchRecvLoop) and Send() (called from
+	// batchCommandsClient.send), and written by recreate(). Because a
+	// panic-restarted batchRecvLoop is spawned as a fresh goroutine while the
+	// previous recv-loop may still be inside recreateStreamingClient (which
+	// releases tryLock.L while reCreating == true), the read and write must be
+	// synchronized through this atomic.Pointer rather than via the parent
+	// batchCommandsClient.tryLock.
+	client        atomic.Pointer[tikvpb.Tikv_BatchCommandsClient]
 	forwardedHost string
 	connIdx       string
 	maxRespReqID  atomic.Uint64
+}
+
+// setClient atomically publishes a new gRPC stream client. It is the only
+// writer of s.client, called from recreate() and from tests.
+func (s *batchCommandsStream) setClient(c tikvpb.Tikv_BatchCommandsClient) {
+	s.client.Store(&c)
+}
+
+// loadClient atomically reads the currently published gRPC stream client.
+// It returns nil if no client has been set yet.
+func (s *batchCommandsStream) loadClient() tikvpb.Tikv_BatchCommandsClient {
+	p := s.client.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// Send forwards a BatchCommandsRequest to the currently published gRPC stream
+// client. It exists so callers (notably batchCommandsClient.send) can call
+// streamClient.Send(req) while the underlying stream pointer is read
+// atomically.
+func (s *batchCommandsStream) Send(req *tikvpb.BatchCommandsRequest) error {
+	c := s.loadClient()
+	if c == nil {
+		return errors.New("batchCommandsStream: send before stream was created")
+	}
+	return c.Send(req)
 }
 
 func (s *batchCommandsStream) recv() (resp *tikvpb.BatchCommandsResponse, err error) {
@@ -902,8 +938,12 @@ func (s *batchCommandsStream) recv() (resp *tikvpb.BatchCommandsResponse, err er
 	if _, err := util.EvalFailpoint("gotErrorInRecvLoop"); err == nil {
 		return nil, errors.New("injected error in batchRecvLoop")
 	}
+	c := s.loadClient()
+	if c == nil {
+		return nil, errors.New("batchCommandsStream: recv before stream was created")
+	}
 	// When `conn.Close()` is called, `client.Recv()` will return an error.
-	resp, err = s.Recv()
+	resp, err = c.Recv()
 	return
 }
 
@@ -921,7 +961,7 @@ func (s *batchCommandsStream) recreate(conn *grpc.ClientConn) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	s.Tikv_BatchCommandsClient = streamClient
+	s.setClient(streamClient)
 	s.maxRespReqID.Store(0)
 	return nil
 }
