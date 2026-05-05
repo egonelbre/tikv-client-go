@@ -302,6 +302,24 @@ func (l *latch) recycle(currentTS uint64) int {
 	return total
 }
 
+// drainWaiters releases every Lock currently parked in any slot's waiting
+// queue. Each waiter is marked stale and its WaitGroup is signaled so the
+// blocked Lock() caller can return. Intended to be called from Close() to
+// avoid leaking goroutines parked on lock.wg.Wait().
+func (latches *Latches) drainWaiters() {
+	for i := range latches.slots {
+		latch := &latches.slots[i]
+		latch.Lock()
+		waiters := latch.waiting
+		latch.waiting = nil
+		latch.Unlock()
+		for _, w := range waiters {
+			w.isStale = true
+			w.wg.Done()
+		}
+	}
+}
+
 func (latches *Latches) recycle(currentTS uint64) {
 	total := 0
 	for i := 0; i < len(latches.slots); i++ {

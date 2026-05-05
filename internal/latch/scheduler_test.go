@@ -39,7 +39,41 @@ import (
 	"math/rand"
 	"sync"
 	"testing"
+	"time"
 )
+
+func TestCloseUnblocksPendingLockWaiters(t *testing.T) {
+	sched := NewScheduler(7)
+
+	keys := [][]byte{[]byte("k1")}
+
+	// First Lock acquires the latch successfully.
+	first := sched.Lock(getTso(), keys)
+	if first.IsStale() {
+		t.Fatalf("unexpected stale on first lock")
+	}
+
+	// Second Lock on the same key blocks in wg.Wait().
+	done := make(chan struct{})
+	go func() {
+		second := sched.Lock(getTso(), keys)
+		_ = second
+		close(done)
+	}()
+
+	// Give the second goroutine a moment to actually park on wg.Wait().
+	time.Sleep(50 * time.Millisecond)
+
+	// Close the scheduler. This must unblock the parked second Lock.
+	sched.Close()
+
+	select {
+	case <-done:
+		// pass
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Lock() did not return within 5s after Close(); waiter leaked")
+	}
+}
 
 func TestWithConcurrency(t *testing.T) {
 	sched := NewScheduler(7)

@@ -107,6 +107,10 @@ func (scheduler *LatchesScheduler) Close() {
 	if !scheduler.closed {
 		close(scheduler.unlockCh)
 		scheduler.closed = true
+		// Unblock any callers that are currently parked in Lock() on a slot's
+		// waiting queue. After closed=true, UnLock becomes a no-op and run()
+		// exits, so without this drain those waiters would sleep forever.
+		scheduler.latches.drainWaiters()
 	}
 }
 
